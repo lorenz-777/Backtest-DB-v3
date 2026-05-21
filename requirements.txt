@@ -1,0 +1,13 @@
+# Scraper-Abhängigkeiten
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+rich>=13.7.0
+
+# Cloudflare-Bypass (beste Methode, optional aber empfohlen)
+curl_cffi>=0.7.0
+
+# Zweite Cloudflare-Bypass-Option (Fallback)
+cloudscraper>=1.2.71
+
+# HTML-Parser (schneller als html.parser)
+lxml>=5.0.0
