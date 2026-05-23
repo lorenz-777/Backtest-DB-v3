@@ -1,0 +1,271 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# retry.yml  –  Scrapt fehlende + unvollständige Ticker nach
+#
+# Ablauf:
+#   1. find-missing   – prüft data.db und erstellt missing_tickers.txt
+#   2. split-tickers  – teilt missing_tickers.txt in Batches auf
+#   3. scrape (Matrix)– parallele Jobs nur für fehlende Ticker
+#   4. merge-db       – fügt Ergebnisse zur bestehenden data.db hinzu
+#
+# Trigger: täglich 04:00 UTC (2h nach Haupt-Run)  |  manuell
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Retry Missing Tickers
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      num_batches:
+        description: "Anzahl paralleler Batches"
+        required: false
+        default: "10"
+      delay:
+        description: "Pause zwischen Tickern in Sekunden"
+        required: false
+        default: "2.0"
+
+env:
+  PYTHON_VERSION: "3.11"
+  DEFAULT_BATCHES: "10"
+  DEFAULT_DELAY:   "2.0"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1: Fehlende + unvollständige Ticker finden
+  # ════════════════════════════════════════════════════════════════════════════
+  find-missing:
+    name: Find Missing Tickers
+    runs-on: ubuntu-latest
+    outputs:
+      has_missing:   ${{ steps.find.outputs.has_missing }}
+      missing_count: ${{ steps.find.outputs.missing_count }}
+      matrix:        ${{ steps.split.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download latest data.db
+        uses: actions/download-artifact@v4
+        with:
+          name: full-db-latest
+          path: .
+        continue-on-error: true
+
+      # Falls kein Artefakt vorhanden: data.db aus Repo nehmen
+      - name: Use repo data.db as fallback
+        run: |
+          if [ ! -f data.db ]; then
+            echo "Kein Artefakt gefunden, nutze data.db aus Repo"
+          else
+            echo "Artefakt data.db geladen ($(du -h data.db | cut -f1))"
+          fi
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Find missing and incomplete tickers
+        id: find
+        run: |
+          python scripts/find_missing.py \
+            --tickers tickers.txt \
+            --db      data.db \
+            --output  missing_tickers.txt
+
+      - name: Show missing tickers count
+        run: |
+          echo "Fehlende Ticker: $(wc -l < missing_tickers.txt)"
+          head -20 missing_tickers.txt
+
+      - name: Split missing tickers into batches
+        id: split
+        if: steps.find.outputs.has_missing == 'true'
+        run: |
+          python scripts/split_tickers.py \
+            --tickers     missing_tickers.txt \
+            --num-batches "${{ github.event.inputs.num_batches || env.DEFAULT_BATCHES }}" \
+            --output-dir  batch_inputs
+
+      - name: Upload batch files
+        if: steps.find.outputs.has_missing == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: retry-batch-inputs
+          path: batch_inputs/
+          retention-days: 1
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2: Matrix – parallele Scrape-Jobs
+  # ════════════════════════════════════════════════════════════════════════════
+  scrape:
+    name: "Retry Batch ${{ matrix.batch_id }}"
+    needs: find-missing
+    if: needs.find-missing.outputs.has_missing == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        batch_id: ${{ fromJson(needs.find-missing.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download batch inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: retry-batch-inputs
+          path: batch_inputs/
+
+      - name: Run scraper for batch ${{ matrix.batch_id }}
+        run: |
+          python scripts/run_batch.py \
+            --batch-file "batch_inputs/batch_${{ matrix.batch_id }}.txt" \
+            --db         "db_retry_${{ matrix.batch_id }}.db" \
+            --delay      "${{ github.event.inputs.delay || env.DEFAULT_DELAY }}"
+        timeout-minutes: 340
+
+      - name: Upload partial DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "db-retry-${{ matrix.batch_id }}"
+          path: "db_retry_${{ matrix.batch_id }}.db"
+          retention-days: 1
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 3: Merge in bestehende data.db
+  # ════════════════════════════════════════════════════════════════════════════
+  merge-db:
+    name: Merge & Commit DB
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download retry partial DBs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: db-retry-*
+          path: db_parts/
+          merge-multiple: true
+
+      - name: Download latest full DB as base
+        uses: actions/download-artifact@v4
+        with:
+          name: full-db-latest
+          path: .
+        continue-on-error: true
+
+      - name: Merge retry DBs into existing data.db
+        run: |
+          python scripts/merge_dbs.py \
+            --parts-dir db_parts/ \
+            --output    data.db \
+            --base      data.db
+
+      - name: Show updated DB stats
+        run: python db.py --status
+
+      - name: Upload updated DB as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-db-latest
+          path: data.db
+          retention-days: 30
+
+      - name: Commit updated DB to repository
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.db
+          git diff --staged --quiet || \
+            git commit -m "chore: retry missing tickers [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+          git push
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 4: Abschlussbericht
+  # ════════════════════════════════════════════════════════════════════════════
+  report:
+    name: Coverage Report
+    needs: merge-db
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main        # neuesten Commit holen nach dem Push
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull latest data.db
+        run: git pull
+
+      - name: Show coverage
+        run: |
+          python3 -c "
+          import sqlite3, os
+          con = sqlite3.connect('data.db')
+
+          # Ticker aus tickers.txt
+          tickers = []
+          with open('tickers.txt') as f:
+              for line in f:
+                  line = line.strip()
+                  if line and not line.startswith('#'):
+                      tickers.append(line.split(':')[0].upper())
+          total = len(tickers)
+
+          print(f'tickers.txt: {total} Ticker')
+          print()
+          for table in ['earnings', 'fundamentals', 'growth']:
+              try:
+                  n = con.execute(f'SELECT COUNT(DISTINCT ticker) FROM {table}').fetchone()[0]
+                  pct = round(n/total*100, 1)
+                  bar = '█' * int(pct/5) + '░' * (20 - int(pct/5))
+                  print(f'{table:<15} {bar} {pct}%  ({n}/{total})')
+              except:
+                  pass
+          print()
+
+          # Leere Felder
+          fields = ['trailing_eps','total_revenue','net_income_to_common','total_debt','total_stockholder_equity']
+          t = con.execute('SELECT COUNT(*) FROM fundamentals').fetchone()[0]
+          print('Leere Felder in fundamentals:')
+          for f in fields:
+              n = con.execute(f'SELECT COUNT(*) FROM fundamentals WHERE {f} IS NULL').fetchone()[0]
+              pct = round(n/t*100, 1) if t else 0
+              print(f'  {f:<30} {n:>6} leer ({pct}%)')
+          con.close()
+          "
