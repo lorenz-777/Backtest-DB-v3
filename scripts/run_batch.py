@@ -2,38 +2,37 @@
 """
 scripts/run_batch.py
 =====================
-Führt den kompletten Scraping-Prozess (Earnings + Fundamentals + Growth)
-für EINEN Batch von Tickern durch und speichert das Ergebnis in einer
-eigenen SQLite-Datenbank.
-
-Dieses Script ist der Worker, der in jedem GitHub-Actions-Matrix-Job
-gestartet wird.
-
-Verwendung:
-    python scripts/run_batch.py \
-        --batch-file batch_inputs/batch_3.txt \
-        --db         db_batch_3.db \
-        --delay      2.0
+Batch-Worker mit Timeout pro Ticker.
+Kein einzelner Ticker kann den ganzen Batch blockieren.
 """
 
 import argparse
+import signal
 import sys
 import time
 import os
 
-# Projektverzeichnis zum Python-Pfad hinzufügen
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rich.console import Console
 from rich.panel import Panel
-
 from db import DB
 
 console = Console()
 
+# Maximale Zeit pro Ticker in Sekunden (5 Minuten)
+TICKER_TIMEOUT = 300
+
+
+class TickerTimeout(Exception):
+    pass
+
+
+def timeout_handler(signum, frame):
+    raise TickerTimeout("Ticker-Timeout")
+
 
 def load_batch(path: str) -> list[tuple[str, str]]:
-    """Liest eine Batch-Datei: TICKER oder TICKER:EXCHANGE pro Zeile."""
     result: list[tuple[str, str]] = []
     try:
         with open(path, encoding="utf-8") as f:
@@ -52,12 +51,30 @@ def load_batch(path: str) -> list[tuple[str, str]]:
     return result
 
 
+def run_with_timeout(fn, *args, timeout=TICKER_TIMEOUT, **kwargs):
+    """Führt fn aus, bricht nach timeout Sekunden ab."""
+    # signal.alarm funktioniert nur auf Unix (Linux/Mac) — GitHub Actions = Linux ✓
+    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(timeout)
+    try:
+        result = fn(*args, **kwargs)
+        signal.alarm(0)
+        return result
+    except TickerTimeout:
+        signal.alarm(0)
+        raise
+    finally:
+        signal.signal(signal.SIGALRM, old_handler)
+        signal.alarm(0)
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Batch-Worker: scrapet einen Ticker-Block")
-    ap.add_argument("--batch-file", required=True,  help="Pfad zur Batch-Ticker-Datei")
-    ap.add_argument("--db",         required=True,  help="Ausgabe-DB-Pfad")
-    ap.add_argument("--delay",      type=float, default=2.0,
-                    help="Pause zwischen Tickern in Sekunden (Standard: 2.0)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--batch-file", required=True)
+    ap.add_argument("--db",         required=True)
+    ap.add_argument("--delay",      type=float, default=2.0)
+    ap.add_argument("--timeout",    type=int,   default=TICKER_TIMEOUT,
+                    help=f"Max. Sekunden pro Ticker (Standard: {TICKER_TIMEOUT})")
     ap.add_argument("--debug",      action="store_true")
     ap.add_argument("--skip-earnings",     action="store_true")
     ap.add_argument("--skip-fundamentals", action="store_true")
@@ -75,12 +92,11 @@ def main() -> None:
     console.print(Panel(
         f"[bold cyan]Batch Worker[/bold cyan]  –  {batch_name}\n"
         f"[dim]{len(tickers)} Ticker  →  {args.db}[/dim]\n"
-        f"[dim]Delay: {args.delay}s  |  Debug: {args.debug}[/dim]",
+        f"[dim]Delay: {args.delay}s  |  Timeout/Ticker: {args.timeout}s[/dim]",
         border_style="cyan", expand=False,
     ))
     console.print()
 
-    # ── Scraper importieren ───────────────────────────────────────────────────
     try:
         from earnings     import process_ticker as earn_process
         from fundamentals import process_ticker as fund_process
@@ -92,19 +108,25 @@ def main() -> None:
     db = DB(args.db)
 
     stats = {
-        "earn_ins":  0, "earn_upd":  0, "earn_fail":  [],
-        "fund_ins":  0, "fund_upd":  0, "fund_fail":  [],
-        "grow_ins":  0, "grow_upd":  0, "grow_fail":  [],
+        "earn_ins": 0, "earn_upd": 0, "earn_fail": [],
+        "fund_ins": 0, "fund_upd": 0, "fund_fail": [],
+        "grow_ins": 0, "grow_upd": 0, "grow_fail": [],
+        "timeout":  [],
     }
 
     for i, (ticker, exchange) in enumerate(tickers, 1):
         console.rule(f"[bold cyan]{i}/{len(tickers)}  {ticker}[/bold cyan]")
         console.print()
 
+        ticker_start = time.time()
+
         # ── Earnings ──────────────────────────────────────────────────────────
         if not args.skip_earnings:
             try:
-                data = earn_process(ticker, exchange, debug=args.debug)
+                data = run_with_timeout(
+                    earn_process, ticker, exchange,
+                    debug=args.debug, timeout=args.timeout
+                )
                 if data:
                     ins, upd = db.upsert_earnings(ticker, data)
                     stats["earn_ins"] += ins
@@ -113,15 +135,22 @@ def main() -> None:
                 else:
                     stats["earn_fail"].append(ticker)
                     console.print(f"  [yellow]⚠ Earnings: keine Daten[/yellow]")
+            except TickerTimeout:
+                stats["earn_fail"].append(ticker)
+                stats["timeout"].append(f"{ticker}/earnings")
+                console.print(f"  [red]⏱ Earnings: Timeout nach {args.timeout}s[/red]")
             except Exception as e:
                 stats["earn_fail"].append(ticker)
                 console.print(f"  [red]❌ Earnings: {e}[/red]")
-            time.sleep(1.0)
+            time.sleep(0.5)
 
         # ── Fundamentals ──────────────────────────────────────────────────────
         if not args.skip_fundamentals:
             try:
-                records = fund_process(ticker, exchange, debug=args.debug)
+                records = run_with_timeout(
+                    fund_process, ticker, exchange,
+                    debug=args.debug, timeout=args.timeout
+                )
                 if records:
                     ins, upd = db.upsert_fundamentals(records)
                     stats["fund_ins"] += ins
@@ -130,15 +159,22 @@ def main() -> None:
                 else:
                     stats["fund_fail"].append(ticker)
                     console.print(f"  [yellow]⚠ Fundamentals: keine Daten[/yellow]")
+            except TickerTimeout:
+                stats["fund_fail"].append(ticker)
+                stats["timeout"].append(f"{ticker}/fundamentals")
+                console.print(f"  [red]⏱ Fundamentals: Timeout nach {args.timeout}s[/red]")
             except Exception as e:
                 stats["fund_fail"].append(ticker)
                 console.print(f"  [red]❌ Fundamentals: {e}[/red]")
-            time.sleep(1.0)
+            time.sleep(0.5)
 
         # ── Growth ────────────────────────────────────────────────────────────
         if not args.skip_growth:
             try:
-                records = growth_process(ticker, db, exchange=exchange, debug=args.debug)
+                records = run_with_timeout(
+                    growth_process, ticker, db,
+                    exchange=exchange, debug=args.debug, timeout=args.timeout
+                )
                 if records:
                     ins, upd = db.upsert_growth(records)
                     stats["grow_ins"] += ins
@@ -147,13 +183,18 @@ def main() -> None:
                 else:
                     stats["grow_fail"].append(ticker)
                     console.print(f"  [yellow]⚠ Growth: keine Daten[/yellow]")
+            except TickerTimeout:
+                stats["grow_fail"].append(ticker)
+                stats["timeout"].append(f"{ticker}/growth")
+                console.print(f"  [red]⏱ Growth: Timeout nach {args.timeout}s[/red]")
             except Exception as e:
                 stats["grow_fail"].append(ticker)
                 console.print(f"  [red]❌ Growth: {e}[/red]")
 
+        elapsed = round(time.time() - ticker_start, 1)
+        console.print(f"  [dim]⏱ {elapsed}s[/dim]")
         console.print()
 
-        # Delay zwischen Tickern (letzter Ticker bekommt keinen Delay)
         if i < len(tickers):
             time.sleep(args.delay)
 
@@ -163,12 +204,7 @@ def main() -> None:
     console.rule("[bold]Batch fertig[/bold]")
     console.print()
 
-    total_ok = len(tickers) - max(
-        len(stats["earn_fail"]),
-        len(stats["fund_fail"]),
-        len(stats["grow_fail"]),
-    )
-
+    timeout_count = len(stats["timeout"])
     lines = (
         f"[bold]{batch_name}[/bold]  –  {len(tickers)} Ticker\n\n"
         f"[bold]Earnings:[/bold]     [green]+{stats['earn_ins']}[/green]  [yellow]~{stats['earn_upd']}[/yellow]"
@@ -177,17 +213,12 @@ def main() -> None:
         + (f"  [red]Fehler: {len(stats['fund_fail'])}[/red]" if stats["fund_fail"] else "") + "\n"
         f"[bold]Growth:[/bold]       [green]+{stats['grow_ins']}[/green]  [yellow]~{stats['grow_upd']}[/yellow]"
         + (f"  [red]Fehler: {len(stats['grow_fail'])}[/red]" if stats["grow_fail"] else "")
+        + (f"\n[red]Timeouts: {timeout_count}[/red]" if timeout_count else "")
     )
-
     console.print(Panel(lines, title="📦 Batch-Ergebnis", border_style="bright_black"))
     console.print()
 
-    # Exit-Code: 0 = OK, 1 = alle Ticker fehlgeschlagen
-    all_failed = (
-        len(stats["earn_fail"]) == len(tickers) and
-        len(stats["fund_fail"]) == len(tickers)
-    )
-    sys.exit(1 if all_failed else 0)
+    sys.exit(0)  # Immer 0 — auch bei Fehlern, Merge soll trotzdem laufen
 
 
 if __name__ == "__main__":
